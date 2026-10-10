@@ -109,6 +109,48 @@ describe('UpdateDialog', () => {
     expect(screen.getByRole('button', { name: 'Explore new features' })).toBeTruthy();
   });
 
+  it('shows reinstall copy and the operator link when the feed forces the installer route', async () => {
+    let openDialogListener: OpenDesignHostUpdaterOpenDialogListener | null = null;
+    const ready = payloadReadyStatus({
+      artifact: {
+        name: 'open-design-1.2.4-setup.exe',
+        platformKey: 'win',
+        type: 'installer',
+        url: 'https://example.test/open-design-1.2.4-setup.exe',
+      },
+      reinstall: {
+        installedVersion: '1.0.0',
+        minVersion: '1.2.0',
+        reason: 'outer-below-min',
+        url: 'https://example.com/reinstall-help',
+      },
+    });
+    restoreHost = installMockOpenDesignHost({
+      host: {
+        updater: {
+          status: vi.fn(async () => ready),
+          subscribeOpenDialog: vi.fn((listener) => {
+            openDialogListener = listener;
+            return vi.fn();
+          }),
+        },
+      },
+    });
+
+    render(<I18nProvider initial="en"><UpdateDialog /></I18nProvider>);
+    await act(async () => {
+      openDialogListener?.({ source: 'mac-app-menu' });
+      await Promise.resolve();
+    });
+
+    await screen.findByRole('dialog', { name: 'Check for updates' });
+    expect(
+      screen.getByText('OpenDesign 1.2.4 requires a full reinstall. OpenDesign will close and open the installer.'),
+    ).toBeTruthy();
+    expect(screen.getByTestId('update-dialog-reinstall-learn-more')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Explore new features' })).toBeNull();
+  });
+
   it('starts an explicit auto-downloading check when opened from an idle menu state', async () => {
     let openDialogListener: OpenDesignHostUpdaterOpenDialogListener | null = null;
     const check = vi.fn(async () => idleStatus({ state: 'not-available' }));
@@ -216,10 +258,50 @@ describe('UpdateDialog', () => {
       await Promise.resolve();
     });
 
-    expect(await screen.findByText("Couldn't check for updates. Please try again shortly.")).toBeTruthy();
+    expect(
+      await screen.findByText(
+        "Couldn't check for updates Version information is temporarily unavailable. Check your network connection and try again.",
+      ),
+    ).toBeTruthy();
     expect(screen.queryByText(/ETIMEDOUT/)).toBeNull();
     expect(screen.queryByRole('button', { name: 'Explore new features' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Check again' })).toBeTruthy();
+  });
+
+  it('renders the S31b product copy as an unpunctuated title line plus body (OPEND-2849)', async () => {
+    let openDialogListener: OpenDesignHostUpdaterOpenDialogListener | null = null;
+    const failed = idleStatus({
+      error: { code: 'network-timeout', message: 'ETIMEDOUT https://updates.example.test/latest.yml' },
+      state: 'error',
+    });
+    restoreHost = installMockOpenDesignHost({
+      host: {
+        updater: {
+          check: vi.fn(async () => failed),
+          status: vi.fn(async () => idleStatus()),
+          subscribeOpenDialog: vi.fn((listener) => {
+            openDialogListener = listener;
+            return vi.fn();
+          }),
+        },
+      },
+    });
+
+    render(<I18nProvider initial="zh-CN"><UpdateDialog /></I18nProvider>);
+    await act(async () => {
+      openDialogListener?.({ source: 'mac-app-menu' });
+      await Promise.resolve();
+    });
+
+    const dialog = await screen.findByRole('dialog');
+    const status = dialog.querySelector('#update-dialog-status') as HTMLElement;
+    await waitFor(() => expect(status.textContent).toContain('暂时无法获取版本信息'));
+    // The status paragraph renders with `white-space: pre-line`, so the first
+    // line is the visible title and the second line is the body.
+    expect(status.textContent?.split('\n')).toEqual([
+      '检查更新失败',
+      '暂时无法获取版本信息，请检查网络连接后重试。',
+    ]);
   });
 
   it('offers a manual download instead of another check when in-app updates are unsupported', async () => {
@@ -294,7 +376,7 @@ describe('UpdateDialog', () => {
     });
     fireEvent.click(await screen.findByRole('button', { name: 'Install and restart' }));
 
-    expect(await screen.findByText('Open Design is still working')).toBeTruthy();
+    expect(await screen.findByText('OpenDesign is still working')).toBeTruthy();
     expect(screen.getByText('2 active tasks are still running. Restarting now will interrupt them.')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Later' })).toHaveFocus();
 

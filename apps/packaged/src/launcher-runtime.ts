@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { access, lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 
 import {
@@ -87,6 +87,12 @@ type ResolvedPayloadConfig = {
 
 export type ResolvePackagedLauncherRuntimeOptions = {
   currentExecutablePath?: string;
+  /**
+   * Pointer from `--od-launcher-delegated-*` argv: the spawning parent
+   * pre-armed attempt.json for this pointer, so a matching attempt marks the
+   * launch in progress rather than a previous failure.
+   */
+  delegated?: LauncherVersionPointer | null;
   resume?: LauncherHandoffResumeRequest | null;
 };
 
@@ -223,9 +229,15 @@ async function resolvePayloadDesktopExecutable(
   return executablePath;
 }
 
-function sameExecutablePath(left: string, right: string): boolean {
-  const normalizedLeft = resolve(left);
-  const normalizedRight = resolve(right);
+async function canonicalExecutablePath(path: string): Promise<string> {
+  return await realpath(path).catch(() => resolve(path));
+}
+
+export async function sameExecutablePath(left: string, right: string): Promise<boolean> {
+  const [normalizedLeft, normalizedRight] = await Promise.all([
+    canonicalExecutablePath(left),
+    canonicalExecutablePath(right),
+  ]);
   return process.platform === "win32"
     ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
     : normalizedLeft === normalizedRight;
@@ -321,9 +333,11 @@ async function resolvePayloadConfig(
     config: {
       ...config,
       appVersion: raw.appVersion?.trim() || manifest.version,
+      daemonCliEntry: await resolveOptionalPayloadEntry(resourcesPath, raw.daemonCliEntryRelative),
       daemonSidecarEntry: await resolveOptionalPayloadEntry(resourcesPath, raw.daemonSidecarEntryRelative),
       nodeCommand,
       resourceRoot,
+      telemetryRelayUrl: raw.telemetryRelayUrl?.trim() || config.telemetryRelayUrl,
       webOutputMode: webOutputMode as PackagedWebOutputMode,
       webSidecarEntry: await resolveOptionalPayloadEntry(resourcesPath, raw.webSidecarEntryRelative),
       webStandaloneRoot,
@@ -469,12 +483,21 @@ export async function resolvePackagedLauncherRuntime(
     descriptor.active.generation === handoff.target.generation &&
     attempted?.version === handoff.target.version &&
     attempted.generation === handoff.target.generation &&
-    sameExecutablePath(currentExecutablePath, handoff.payloadExecutablePath)
+    await sameExecutablePath(currentExecutablePath, handoff.payloadExecutablePath)
     ? handoff.target
     : null;
-  const selection = selectLauncherRuntimeTarget({ attempted, resume: requestedResume, runtime: descriptor });
+  const selection = selectLauncherRuntimeTarget({
+    attempted,
+    delegated: options.delegated ?? null,
+    resume: requestedResume,
+    runtime: descriptor,
+  });
   const persistedInstall = await readLauncherInstallDescriptor(launcherPaths, channel, config.namespace).catch(() => null);
-  const currentPackageLaunchPath = stableAppLaunchPathFromExecutable(process.execPath);
+  // Track the stable launch path of the CURRENT launcher executable (the
+  // `currentExecutablePath` option, defaulting to process.execPath), so the
+  // payload branch can refresh install.json when an update moved the launcher
+  // (issue #6494) instead of keeping a stale persisted launchPath forever.
+  const currentPackageLaunchPath = stableAppLaunchPathFromExecutable(currentExecutablePath);
 
   if (selection.selected) {
     const versionPaths = resolveLauncherVersionPaths({
@@ -485,16 +508,16 @@ export async function resolvePackagedLauncherRuntime(
     });
     const payloadConfig = await resolvePayloadConfig(config, versionPaths, channel);
     if (payloadConfig != null) {
-      const payloadDesktopProcess = sameExecutablePath(
+      const payloadDesktopProcess = await sameExecutablePath(
         currentExecutablePath,
         payloadConfig.desktopExecutablePath,
       );
       if (
         selection.reason === "active-resume" &&
-        (handoff == null || !payloadDesktopProcess || !sameExecutablePath(
+        (handoff == null || !payloadDesktopProcess || !(await sameExecutablePath(
           handoff.payloadExecutablePath,
           payloadConfig.desktopExecutablePath,
-        ))
+        )))
       ) {
         return await resolvePackagedLauncherRuntime(config, paths, {
           currentExecutablePath,
@@ -511,12 +534,34 @@ export async function resolvePackagedLauncherRuntime(
           version: selection.pointer.version,
         } satisfies LauncherAttemptDescriptor);
       }
+      // Issue #6494: the payload branch previously only READ the persisted
+      // install.json launchPath (written by the cold-start current-package
+      // branch) and never refreshed it, so after an update that moved the
+      // launcher executable (0.17.0 Local\Programs\... → 0.18.0 launcher
+      // payload), the stale path kept flowing into the MCP bootstrap
+      // command published by /api/mcp/install-info, making MCP clients
+      // relaunch the old executable on the same sidecar pipe until the
+      // launcher's stale-sidecar sweep killed the fresh daemon. Refresh
+      // install.json so launchPath tracks the current launcher executable
+      // across updates. Only the launcher process owns the descriptor: a
+      // delegated payload desktop runs from the versioned payload exe and
+      // must keep the stable launch path the launcher persisted.
+      const installedLaunchPath = !payloadDesktopProcess
+        && (persistedInstall == null
+          || !(await sameExecutablePath(persistedInstall.launchPath, currentPackageLaunchPath)))
+        ? (await writeLauncherInstallDescriptor(
+          launcherPaths,
+          channel,
+          config.namespace,
+          currentPackageLaunchPath,
+        )).launchPath
+        : (persistedInstall?.launchPath ?? currentPackageLaunchPath);
       return {
         config: payloadConfig.config,
         desktopExecutablePath: payloadConfig.desktopExecutablePath,
         descriptor,
         electronNodeCommand: payloadConfig.electronNodeCommand,
-        installedLaunchPath: persistedInstall?.launchPath ?? currentPackageLaunchPath,
+        installedLaunchPath,
         launcherPaths,
         paths: { ...paths, resourceRoot: payloadConfig.config.resourceRoot },
         payloadDesktopProcess,
@@ -552,7 +597,15 @@ async function writeJsonFile(path: string, payload: unknown): Promise<void> {
   await writeFile(path, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
-export async function recordPackagedLauncherRuntimeFailedAttempt(
+/**
+ * Arm attempt.json for a normal active delegation BEFORE the payload spawns.
+ * A payload that dies before reaching its own launcher bookkeeping then still
+ * leaves rollback evidence, so the next cold start rolls back to
+ * lastSuccessful instead of retrying the broken payload forever. Rollback
+ * (last-successful) delegations are deliberately excluded: the attempt on
+ * disk IS the rollback evidence and must not be overwritten.
+ */
+export async function armPackagedLauncherRuntimeAttempt(
   runtime: PackagedLauncherRuntime,
 ): Promise<void> {
   if (runtime.source !== "payload") return;
@@ -567,12 +620,20 @@ export async function recordPackagedLauncherRuntimeFailedAttempt(
   } satisfies LauncherAttemptDescriptor);
 }
 
+export async function recordPackagedLauncherRuntimeFailedAttempt(
+  runtime: PackagedLauncherRuntime,
+): Promise<void> {
+  await armPackagedLauncherRuntimeAttempt(runtime);
+}
+
 export async function confirmPackagedLauncherRuntime(runtime: PackagedLauncherRuntime): Promise<void> {
   if (runtime.source !== "payload") return;
   if (!runtime.payloadDesktopProcess) return;
   if (runtime.desktopExecutablePath == null) return;
   if (!runtime.selection.selected || (
-    runtime.selection.reason !== "active" && runtime.selection.reason !== "active-resume"
+    runtime.selection.reason !== "active" &&
+    runtime.selection.reason !== "active-delegated" &&
+    runtime.selection.reason !== "active-resume"
   )) return;
   const confirmedAt = new Date().toISOString();
   const next: LauncherRuntimeDescriptor = {

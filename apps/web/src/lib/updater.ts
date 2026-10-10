@@ -1,6 +1,7 @@
 import {
   OPEN_DESIGN_HOST_UPDATER_STATES,
   checkHostUpdater,
+  clearHostUpdaterCache,
   downloadHostUpdater,
   getHostUpdaterStatus,
   installHostUpdater,
@@ -14,6 +15,7 @@ import {
   type OpenDesignHostUpdaterActionOptions,
   type OpenDesignHostUpdaterMenuLabels,
   type OpenDesignHostUpdaterOpenDialogListener,
+  type OpenDesignHostUpdaterReinstallSnapshot,
   type OpenDesignHostUpdaterResult,
   type OpenDesignHostUpdaterStatusListener,
   type OpenDesignHostUpdaterStatusSnapshot,
@@ -52,6 +54,12 @@ export type UpdaterModel = {
   installerOpened: boolean;
   updateKind: 'installer' | 'payload' | 'unknown';
   promptKey: string | null;
+  /**
+   * Present when the feed requires a full installer reinstall (broken or
+   * outdated installed outer package). UI copy priority: `reinstall.url`
+   * jump link > default i18n reinstall copy.
+   */
+  reinstall: OpenDesignHostUpdaterReinstallSnapshot | null;
   requiresManualInstall: boolean;
   upToDate: boolean;
   shouldShowControl: boolean;
@@ -92,6 +100,20 @@ function downloadProgressFromStatus(
     receivedBytes,
     totalBytes,
   };
+}
+
+/**
+ * The desktop updater reports every download-phase transport failure under this
+ * code (`apps/desktop/src/main/updater.ts` → `desktopDownloadError`). It is the
+ * only signal that tells "the update download did not finish" (product copy
+ * S31c, OPEND-2849) apart from a failed update check.
+ */
+export const UPDATER_DOWNLOAD_FAILED_CODE = 'download-failed';
+
+export function isUpdaterDownloadFailure(
+  status: Pick<OpenDesignHostUpdaterStatusSnapshot, 'error'> | null | undefined,
+): boolean {
+  return status?.error?.code === UPDATER_DOWNLOAD_FAILED_CODE;
 }
 
 export function deriveUpdaterModel(
@@ -157,6 +179,7 @@ export function deriveUpdaterModel(
     installerOpened,
     updateKind,
     promptKey,
+    reinstall: status?.reinstall ?? null,
     requiresManualInstall: Boolean(status?.capabilities.requiresManualInstall),
     upToDate,
     shouldShowControl: canInstallUpdate && hasDownloadedInstaller && !installerOpened,
@@ -180,6 +203,10 @@ export async function downloadUpdaterUpdate(options?: OpenDesignHostUpdaterActio
 
 export async function openUpdaterInstaller(options?: OpenDesignHostUpdaterActionOptions): Promise<UpdaterActionResult> {
   return modelFromHostResult(await installHostUpdater(options));
+}
+
+export async function clearUpdaterCache(options?: OpenDesignHostUpdaterActionOptions): Promise<UpdaterActionResult> {
+  return modelFromHostResult(await clearHostUpdaterCache(options));
 }
 
 export async function quitAfterUpdaterInstallerOpen(

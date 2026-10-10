@@ -1,31 +1,17 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { parseLauncherAfterQuitArgs } from "@open-design/launcher-proto";
-import { readProcessStamp } from "@open-design/platform";
-import {
-  APP_KEYS,
-  OPEN_DESIGN_SIDECAR_CONTRACT,
-  SIDECAR_MODES,
-  SIDECAR_SOURCES,
-  type SidecarStamp,
-} from "@open-design/sidecar-proto";
+import { parseLauncherAfterQuitArgs, parseLauncherDelegatedArgs } from "@open-design/launcher-proto";
 import { describe, expect, it, vi } from "vitest";
 
 import type { PackagedLauncherRuntime } from "../src/launcher-runtime.js";
 import {
+  findPackagedDeeplinkArg,
   launchPackagedPayloadDesktop,
   planPackagedPayloadDesktopDelegation,
 } from "../src/payload-desktop-launch.js";
-
-const stamp: SidecarStamp = {
-  app: APP_KEYS.DESKTOP,
-  ipc: "/tmp/open-design/ipc/release-beta/desktop.sock",
-  mode: SIDECAR_MODES.RUNTIME,
-  namespace: "release-beta",
-  source: SIDECAR_SOURCES.PACKAGED,
-};
 
 function fakeRuntime(payloadDesktopProcess: boolean): PackagedLauncherRuntime {
   return {
@@ -35,7 +21,7 @@ function fakeRuntime(payloadDesktopProcess: boolean): PackagedLauncherRuntime {
     electronNodeCommand: null,
     installedLaunchPath: "/Applications/Open Design Beta.app",
     launcherPaths: {} as PackagedLauncherRuntime["launcherPaths"],
-    paths: {} as PackagedLauncherRuntime["paths"],
+    paths: { dataRoot: "/tmp/data", runtimeRoot: "/tmp/runtime" } as PackagedLauncherRuntime["paths"],
     payloadDesktopProcess,
     selection: {
       pointer: { generation: 1, version: "1.2.3-beta.5" },
@@ -48,9 +34,9 @@ function fakeRuntime(payloadDesktopProcess: boolean): PackagedLauncherRuntime {
 }
 
 describe("payload desktop delegation", () => {
-  it("plans an early outer-to-payload handoff with stable after-quit and stamp args", () => {
+  it("plans the launcher handoff while leaving stamp serialization to sidecar", () => {
     const runtime = fakeRuntime(false);
-    const plan = planPackagedPayloadDesktopDelegation(runtime, stamp, {
+    const plan = planPackagedPayloadDesktopDelegation(runtime, {
       currentPid: 4321,
       timeoutMs: 60_000,
     });
@@ -63,39 +49,173 @@ describe("payload desktop delegation", () => {
       targetPid: 4321,
       timeoutMs: 60_000,
     });
-    expect(readProcessStamp(plan?.args ?? [], OPEN_DESIGN_SIDECAR_CONTRACT)).toEqual(stamp);
+    expect(plan?.args.some((arg) => arg.startsWith("--od-sidecar-"))).toBe(false);
+  });
+
+  it("carries the delegated pointer for a normal active delegation", () => {
+    const plan = planPackagedPayloadDesktopDelegation(fakeRuntime(false), {
+      currentPid: 4321,
+      timeoutMs: 60_000,
+    });
+    expect(parseLauncherDelegatedArgs(plan?.args ?? [])).toEqual({
+      generation: 1,
+      version: "1.2.3-beta.5",
+    });
+  });
+
+  it("forwards only the OS invite URL across an outer-to-payload cold start", () => {
+    const deeplink = "opendesign://workspace/invite/continue?nonce=payload-cold-start";
+    expect(findPackagedDeeplinkArg(["Open Design.exe", "--unrelated", deeplink])).toBe(deeplink);
+    expect(findPackagedDeeplinkArg(["Open Design.exe", "--unrelated"])).toBeNull();
+    const plan = planPackagedPayloadDesktopDelegation(fakeRuntime(false), {
+      currentPid: 4321,
+      forwardedArgs: ["Open Design.exe", "--unrelated", deeplink],
+      timeoutMs: 60_000,
+    });
+
+    expect(plan?.args).toContain(deeplink);
+    expect(plan?.args).not.toContain("--unrelated");
+  });
+
+  it("carries launch-mode arguments so a delegated headless launch stays headless", () => {
+    const plan = planPackagedPayloadDesktopDelegation(fakeRuntime(false), {
+      currentPid: 4321,
+      extraArgs: ["--headless"],
+      forwardedArgs: ["Open Design", "--headless", "--unrelated"],
+      timeoutMs: 60_000,
+    });
+    // The payload re-derives its sidecar mode from its own argv, so the mode flag must arrive
+    // together with the delegated pointer that keeps its pre-armed attempt from reading as a failure.
+    expect(plan?.args.filter((arg) => arg === "--headless")).toEqual(["--headless"]);
+    expect(plan?.args).not.toContain("--unrelated");
+    expect(parseLauncherDelegatedArgs(plan?.args ?? [])).toEqual({ generation: 1, version: "1.2.3-beta.5" });
+  });
+
+  it("omits the delegated pointer for a rollback delegation", () => {
+    // A last-successful delegation is driven by rollback evidence in
+    // attempt.json; marking it delegated (or re-arming) would let the spawned
+    // payload re-select the broken active generation.
+    const runtime: PackagedLauncherRuntime = {
+      ...fakeRuntime(false),
+      selection: {
+        pointer: { generation: 0, version: "1.2.3-beta.4" },
+        reason: "last-successful",
+        selected: true,
+      },
+    };
+    const plan = planPackagedPayloadDesktopDelegation(runtime, {
+      currentPid: 4321,
+      timeoutMs: 60_000,
+    });
+    expect(plan).not.toBeNull();
+    expect(parseLauncherDelegatedArgs(plan?.args ?? [])).toBeNull();
+  });
+
+  it("pre-arms the launch attempt before spawning the delegated payload", async () => {
+    // A payload that dies before reaching its own bookkeeping must still
+    // leave rollback evidence — the parent arms attempt.json BEFORE spawn so
+    // the next cold start rolls back instead of retrying the broken payload
+    // forever.
+    const root = await mkdtemp(join(tmpdir(), "od-delegated-arm-"));
+    try {
+      const attemptsPath = join(root, "state", "attempt.json");
+      const runtime: PackagedLauncherRuntime = {
+        ...fakeRuntime(false),
+        launcherPaths: {
+          attemptsPath,
+          channel: "beta",
+          namespace: "release-beta",
+        } as PackagedLauncherRuntime["launcherPaths"],
+      };
+      let spawnSawAttempt: boolean | null = null;
+      const handoff = vi.fn(async () => {
+        spawnSawAttempt = existsSync(attemptsPath);
+      });
+
+      const launched = await launchPackagedPayloadDesktop(runtime, { handoff });
+
+      expect(launched).toBe(true);
+      expect(spawnSawAttempt).toBe(true);
+      const attempt = JSON.parse(await readFile(attemptsPath, "utf8")) as Record<string, unknown>;
+      expect(attempt).toMatchObject({
+        channel: "beta",
+        generation: 1,
+        namespace: "release-beta",
+        version: "1.2.3-beta.5",
+      });
+      expect(handoff).toHaveBeenCalledWith(expect.objectContaining({
+        command: runtime.desktopExecutablePath,
+      }), { timeoutMs: 60_000 });
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  it("does not pre-arm a rollback delegation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "od-delegated-rollback-"));
+    try {
+      const attemptsPath = join(root, "state", "attempt.json");
+      const runtime: PackagedLauncherRuntime = {
+        ...fakeRuntime(false),
+        launcherPaths: {
+          attemptsPath,
+          channel: "beta",
+          namespace: "release-beta",
+        } as PackagedLauncherRuntime["launcherPaths"],
+        selection: {
+          pointer: { generation: 0, version: "1.2.3-beta.4" },
+          reason: "last-successful",
+          selected: true,
+        },
+      };
+      await launchPackagedPayloadDesktop(runtime, {
+        handoff: vi.fn(async () => undefined),
+      });
+
+      expect(existsSync(attemptsPath)).toBe(false);
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
   });
 
   it("does not delegate once the current process already is the payload desktop", () => {
-    expect(planPackagedPayloadDesktopDelegation(fakeRuntime(true), stamp, {
+    expect(planPackagedPayloadDesktopDelegation(fakeRuntime(true), {
       currentPid: 4321,
       timeoutMs: 60_000,
     })).toBeNull();
   });
 
-  it("waits for spawn acceptance and detaches the payload child", async () => {
-    const once = vi.fn((event: string, callback: (...args: unknown[]) => void) => {
-      if (event === "spawn") queueMicrotask(callback);
-      return child;
-    });
-    const child = {
-      once,
-      unref: vi.fn(),
-    };
-    const spawn = vi.fn(() => child);
+  it("delegates the next child to the current sidecar generation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "od-delegated-spawn-"));
+    try {
+      const handoff = vi.fn(async () => undefined);
+      const runtime: PackagedLauncherRuntime = {
+        ...fakeRuntime(false),
+        launcherPaths: {
+          attemptsPath: join(root, "state", "attempt.json"),
+          channel: "beta",
+          namespace: "release-beta",
+        } as PackagedLauncherRuntime["launcherPaths"],
+      };
 
-    const delegated = await launchPackagedPayloadDesktop(fakeRuntime(false), stamp, {
-      currentPid: 4321,
-      spawn: spawn as never,
-      timeoutMs: 60_000,
-    });
+      const delegated = await launchPackagedPayloadDesktop(runtime, {
+        currentPid: 4321,
+        handoff,
+        timeoutMs: 60_000,
+      });
 
-    expect(delegated).toBe(true);
-    expect(spawn).toHaveBeenCalledOnce();
-    expect(child.unref).toHaveBeenCalledOnce();
+      expect(delegated).toBe(true);
+      expect(handoff).toHaveBeenCalledWith(expect.objectContaining({
+        args: expect.any(Array),
+        command: runtime.desktopExecutablePath,
+        cwd: dirname(runtime.desktopExecutablePath ?? ""),
+      }), { timeoutMs: 60_000 });
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
   });
 
-  it("records a failed attempt when the payload executable cannot spawn", async () => {
+  it("records a failed attempt when the supervisor rejects the handoff", async () => {
     const root = await mkdtemp(join(tmpdir(), "od-payload-desktop-spawn-failure-"));
     const runtime = fakeRuntime(false);
     runtime.launcherPaths = {
@@ -103,18 +223,10 @@ describe("payload desktop delegation", () => {
       channel: "beta",
       namespace: "release-beta",
     } as PackagedLauncherRuntime["launcherPaths"];
-    const spawnError = new Error("spawn EACCES");
-    const child = {
-      once: vi.fn((event: string, callback: (...args: unknown[]) => void) => {
-        if (event === "error") queueMicrotask(() => callback(spawnError));
-        return child;
-      }),
-      unref: vi.fn(),
-    };
     try {
-      await expect(launchPackagedPayloadDesktop(runtime, stamp, {
-        spawn: vi.fn(() => child) as never,
-      })).rejects.toThrow("spawn EACCES");
+      await expect(launchPackagedPayloadDesktop(runtime, {
+        handoff: vi.fn(async () => { throw new Error("handoff rejected"); }),
+      })).rejects.toThrow("handoff rejected");
 
       expect(JSON.parse(await readFile(runtime.launcherPaths.attemptsPath, "utf8"))).toMatchObject({
         channel: "beta",
@@ -123,7 +235,6 @@ describe("payload desktop delegation", () => {
         schemaVersion: 1,
         version: "1.2.3-beta.5",
       });
-      expect(child.unref).not.toHaveBeenCalled();
     } finally {
       await rm(root, { force: true, recursive: true });
     }

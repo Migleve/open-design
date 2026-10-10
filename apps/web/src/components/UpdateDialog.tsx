@@ -15,6 +15,7 @@ import {
   checkForUpdaterUpdate,
   deriveUpdaterModel,
   downloadUpdaterUpdate,
+  isUpdaterDownloadFailure,
   openUpdaterInstaller,
   quitAfterUpdaterInstallerOpen,
   readUpdaterStatus,
@@ -328,13 +329,24 @@ export function UpdateDialog() {
       return t('updater.activeRunsBody', { count: restartSafety.activeRunCount });
     }
     if (restartSafety?.state === 'unknown') return t('updater.activeRunsUnknownBody');
+    // 产品《报错文案》S31c(OPEND-2849):下载失败单独成句,见 `isUpdaterDownloadFailure`。
+    const downloadFailed = isUpdaterDownloadFailure(status);
     if (actionError != null) {
+      if (downloadFailed) return t('updater.dialogDownloadFailed');
       return ready || available || installing
         ? t('settings.updateActionFailed')
         : t('updater.dialogCheckFailed');
     }
     if (status?.error != null && restartSafetyFromUpdaterStatus(status) == null) {
+      if (downloadFailed) return t('updater.dialogDownloadFailed');
       return state === 'error' ? t('updater.dialogCheckFailed') : t('settings.updateActionFailed');
+    }
+    // A forced installer reinstall reads differently from a routine update:
+    // the same copy covers both the not-yet-downloaded and ready states.
+    if ((ready || available) && model.reinstall != null) {
+      return model.availableVersion == null
+        ? t('updater.reinstallReadyGeneric')
+        : t('updater.reinstallReadyVersion', { version: model.availableVersion });
     }
     if (ready) {
       if (model.availableVersion != null) {
@@ -366,6 +378,7 @@ export function UpdateDialog() {
   })();
 
   const showSafety = restartSafety != null;
+  const reinstallUrl = model.reinstall?.url ?? null;
   const title = showSafety ? t('updater.activeRunsTitle') : t('settings.updateCheck');
   const primaryLabel = (() => {
     if (ready) return model.updateKind === 'payload' ? t('updater.installRestart') : t('updater.openInstaller');
@@ -417,13 +430,24 @@ export function UpdateDialog() {
         ) : null}
         {!showSafety && (available || ready) ? (
           <div className={styles.metaRow}>
-            <button
-              className={styles.releaseLink}
-              onClick={openReleaseNotes}
-              type="button"
-            >
-              {t('updater.viewVersionFeatures')} <Icon name="external-link" size={13} />
-            </button>
+            {reinstallUrl != null ? (
+              <button
+                className={styles.releaseLink}
+                data-testid="update-dialog-reinstall-learn-more"
+                onClick={() => void openExternalUrl(reinstallUrl)}
+                type="button"
+              >
+                {t('updater.reinstallLearnMore')} <Icon name="external-link" size={13} />
+              </button>
+            ) : (
+              <button
+                className={styles.releaseLink}
+                onClick={openReleaseNotes}
+                type="button"
+              >
+                {t('updater.viewVersionFeatures')} <Icon name="external-link" size={13} />
+              </button>
+            )}
           </div>
         ) : null}
         <div className={`${styles.actions} ${model.upToDate ? styles.actionsCentered : ''}`}>
